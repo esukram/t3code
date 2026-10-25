@@ -17,13 +17,19 @@ import { useAtomCommand } from "./use-atom-command";
 export const ORCHESTRATION_OPERATE_DENIED_MESSAGE =
   "This connection cannot change threads or projects.";
 
+/**
+ * `permitted` replaces the live operate check, so settle, snooze and their undo can pass the
+ * remembered offline grant. It runs on every call, like the default.
+ */
 export function useOrchestrationCommand<W extends { readonly environmentId: EnvironmentId }, A, E>(
   command: AtomCommand<W, A, E>,
   options?: string | AtomCommandOptions,
+  permitted: (environmentId: EnvironmentId) => boolean = (environmentId) =>
+    readEnvironmentScope(environmentId, AuthOrchestrationOperateScope),
 ): (value: W) => Promise<AtomCommandResult<A, E | EnvironmentAuthorizationError>> {
   const run = useAtomCommand(command, options);
   return async (value: W): Promise<AtomCommandResult<A, E | EnvironmentAuthorizationError>> => {
-    if (!readEnvironmentScope(value.environmentId, AuthOrchestrationOperateScope)) {
+    if (!permitted(value.environmentId)) {
       return AsyncResult.failure(
         Cause.fail(
           new EnvironmentAuthorizationError({

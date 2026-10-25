@@ -196,9 +196,9 @@ export function createThreadEnvironmentAtoms<R, E>(
     /** Offline settle and snooze replay once this reports a synchronized shell. */
     readonly shellStatusAtom?: (environmentId: EnvironmentId) => Atom.Atom<EnvironmentShellStatus>;
     /** Whether the loaded session can change threads; null until it loads. */
-    readonly operateScopeAtom?: (
-      environmentId: EnvironmentId,
-    ) => Atom.Atom<{ readonly granted: boolean } | null>;
+    readonly operateScopeAtom?: (environmentId: EnvironmentId) => Atom.Atom<boolean | null>;
+    /** Whether the environment is registered; null until the catalog loads. */
+    readonly registeredAtom?: (environmentId: EnvironmentId) => Atom.Atom<boolean | null>;
     /** Cached config; offline changes queue only for servers that can check them. */
     readonly serverConfigAtom?: (environmentId: EnvironmentId) => Atom.Atom<ServerConfig | null>;
   } = {},

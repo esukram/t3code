@@ -92,13 +92,13 @@ export function createThreadTriageOutbox<R, E>(input: {
   ) => Atom.Atom<OrchestrationV2ShellSnapshot | null>;
   /** Replay waits for a synchronized shell; without one, nothing replays. */
   readonly shellStatusAtom?: (environmentId: EnvironmentId) => Atom.Atom<EnvironmentShellStatus>;
+  /** Whether the loaded session can change threads; null until it loads. */
+  readonly operateScopeAtom?: (environmentId: EnvironmentId) => Atom.Atom<boolean | null>;
   /**
-   * Whether the loaded session can change threads; null until it loads. A new object means a
-   * newly loaded session, which is how a removed environment's old grant is told apart.
+   * Whether the environment is registered; null until the catalog loads. Only a registered
+   * environment's session may be remembered, so a removed one's late session grants nothing.
    */
-  readonly operateScopeAtom?: (
-    environmentId: EnvironmentId,
-  ) => Atom.Atom<{ readonly granted: boolean } | null>;
+  readonly registeredAtom?: (environmentId: EnvironmentId) => Atom.Atom<boolean | null>;
   /** Cached config; only servers that check the snapshot sequence get queued changes. */
   readonly serverConfigAtom?: (environmentId: EnvironmentId) => Atom.Atom<ServerConfig | null>;
   readonly applySettle: (
@@ -174,8 +174,6 @@ export function createThreadTriageOutbox<R, E>(input: {
 
   /** Bumped when an environment is removed so in-flight work does not re-add its entries. */
   const generations = new Map<EnvironmentId, number>();
-  /** The session grant current when each environment was removed. */
-  const removedGrants = new Map<EnvironmentId, object | null>();
   const documentAtom = Atom.make<ThreadTriageOutboxDocument | null>(null).pipe(Atom.keepAlive);
   let loading: Promise<ThreadTriageOutboxDocument> | undefined;
   const ensureLoaded = (registry: AtomRegistry.AtomRegistry) => {
@@ -212,10 +210,6 @@ export function createThreadTriageOutbox<R, E>(input: {
   const claimed = new Set<string>();
   const clearLocal = (registry: AtomRegistry.AtomRegistry, environmentId: EnvironmentId) => {
     generations.set(environmentId, (generations.get(environmentId) ?? 0) + 1);
-    removedGrants.set(
-      environmentId,
-      input.operateScopeAtom ? registry.get(input.operateScopeAtom(environmentId)) : null,
-    );
     const document = registry.get(documentAtom);
     if (document === null) return;
     registry.set(documentAtom, {
@@ -346,6 +340,9 @@ export function createThreadTriageOutbox<R, E>(input: {
         if (owns) claimed.add(claimKey);
         const generation = generations.get(environmentId) ?? 0;
         const current = () => (generations.get(environmentId) ?? 0) === generation;
+        // The server compares against what the user saw when acting, not what arrives later.
+        const snapshot = registry.get(input.sourceSnapshotAtom(environmentId));
+        const thread = snapshot?.threads.find((candidate) => candidate.id === key.threadId);
         try {
           // Started before any await so the optimistic change shows in the same frame.
           const result = await command.run(registry, target);
@@ -370,8 +367,6 @@ export function createThreadTriageOutbox<R, E>(input: {
             );
           }
           await ensureLoaded(registry);
-          const snapshot = registry.get(input.sourceSnapshotAtom(environmentId));
-          const thread = snapshot?.threads.find((candidate) => candidate.id === key.threadId);
           if (snapshot == null || thread === undefined || !current()) return result;
           // The put replaces any earlier entry for the thread, so a failed save keeps it.
           const queued = await store.run(registry, {
@@ -446,33 +441,34 @@ export function createThreadTriageOutbox<R, E>(input: {
    */
   const offlineTriagePermittedAtom = Atom.family((environmentId: EnvironmentId) =>
     Atom.make((get) => {
+      const registeredAtom = input.registeredAtom?.(environmentId);
+      const registered = registeredAtom === undefined ? true : get(registeredAtom);
+      if (registered === false) return false;
       const known = input.operateScopeAtom ? get(input.operateScopeAtom(environmentId)) : null;
       const document = get(loadedDocumentAtom);
       const remembered = document?.operableEnvironmentIds.includes(environmentId) ?? false;
       if (known === null) return remembered;
-      // The session kept from before a removal must not restore its grant; a new one may.
-      if (removedGrants.has(environmentId)) {
-        if (removedGrants.get(environmentId) === known) return remembered;
-        removedGrants.delete(environmentId);
-      }
       const generation = generations.get(environmentId) ?? 0;
-      if (document !== null && known.granted !== remembered) {
+      if (registered === true && document !== null && known !== remembered) {
         const registry = get.registry;
         registry.set(documentAtom, {
           ...document,
           operableEnvironmentIds: [
             ...document.operableEnvironmentIds.filter((id) => id !== environmentId),
-            ...(known.granted ? [environmentId] : []),
+            ...(known ? [environmentId] : []),
           ],
         });
         void store.run(registry, {
           _tag: "setOperable",
           environmentId,
-          operable: known.granted,
-          stillCurrent: () => (generations.get(environmentId) ?? 0) === generation,
+          operable: known,
+          // Checked inside the store's lock, after any removal that started first.
+          stillCurrent: () =>
+            (generations.get(environmentId) ?? 0) === generation &&
+            (registeredAtom === undefined || registry.get(registeredAtom) === true),
         });
       }
-      return known.granted;
+      return known;
     }),
   );
 

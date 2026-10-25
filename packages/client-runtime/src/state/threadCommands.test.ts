@@ -108,6 +108,7 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
   /** The guard capability in the cached config, which may differ from the live server's. */
   readonly cachedVersionGuard?: boolean;
   readonly wrapStore?: (store: ThreadTriageOutboxStoreShape) => ThreadTriageOutboxStoreShape;
+  readonly registered?: boolean | null;
 }) {
   const requests = yield* Queue.unbounded<{
     command: OrchestrationV2Command;
@@ -179,9 +180,7 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
     Atom.make<EnvironmentShellStatus>(options?.connected === false ? "cached" : "live"),
   );
   const operateScopeAtom = Atom.family((_environmentId: EnvironmentId) =>
-    Atom.make<{ readonly granted: boolean } | null>(
-      options?.operateScope === null ? null : { granted: options?.operateScope ?? true },
-    ),
+    Atom.make<boolean | null>(options?.operateScope === undefined ? true : options.operateScope),
   );
   const serverConfigAtom = Atom.family((_environmentId: EnvironmentId) =>
     Atom.make({
@@ -190,10 +189,14 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
       },
     } as unknown as ServerConfig),
   );
+  const registeredAtom = Atom.family((_environmentId: EnvironmentId) =>
+    Atom.make<boolean | null>(options?.registered === undefined ? true : options.registered),
+  );
   const commands = createThreadEnvironmentAtoms(runtime, snapshotAtom, {
     shellStatusAtom: statusAtom,
     operateScopeAtom,
     serverConfigAtom,
+    registeredAtom,
   });
   const registry = AtomRegistry.make();
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
@@ -212,6 +215,7 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
     snapshotAtom,
     statusAtom,
     operateScopeAtom,
+    registeredAtom,
     visibleAtom,
     requests,
     reconciled,
@@ -854,7 +858,7 @@ describe("settle and snooze while the environment is offline", () => {
       yield* waitFor(coldOffline.registry, permitted, (value) => value);
 
       // A session that loads without the scope wins and is remembered for the next restart.
-      coldOffline.registry.set(coldOffline.operateScopeAtom(ENVIRONMENT_ID), { granted: false });
+      coldOffline.registry.set(coldOffline.operateScopeAtom(ENVIRONMENT_ID), false);
       expect(coldOffline.registry.get(permitted)).toBe(false);
       yield* Queue.take(writes);
       const restarted = yield* makeHarness({ connected: false, storage, operateScope: null });
@@ -921,6 +925,7 @@ describe("settle and snooze while the environment is offline", () => {
         connected: false,
         storage,
         operateScope: true,
+        registered: false,
         wrapStore: (store) => ({
           ...store,
           load: store.load.pipe(Effect.tap(() => store.clearEnvironment(ENVIRONMENT_ID))),
@@ -954,6 +959,7 @@ describe("settle and snooze while the environment is offline", () => {
       const writes = yield* Queue.unbounded<string>();
       const storage = { value: null as string | null, writes };
       let removeBeforeWrite = true;
+      let unregister = () => {};
       const h = yield* makeHarness({
         connected: false,
         storage,
@@ -965,11 +971,13 @@ describe("settle and snooze while the environment is offline", () => {
             (removeBeforeWrite
               ? Effect.sync(() => {
                   removeBeforeWrite = false;
+                  unregister();
                 }).pipe(Effect.andThen(store.clearEnvironment(environmentId)))
               : Effect.void
             ).pipe(Effect.andThen(store.setOperable(environmentId, operable, stillCurrent))),
         }),
       });
+      unregister = () => h.registry.set(h.registeredAtom(ENVIRONMENT_ID), false);
       const permitted = h.commands.offlineTriagePermittedAtom(ENVIRONMENT_ID);
       h.registry.mount(permitted);
       expect(JSON.parse(yield* Queue.take(writes)).operableEnvironmentIds).toEqual([]);
@@ -981,8 +989,8 @@ describe("settle and snooze while the environment is offline", () => {
         operableEnvironmentIds: [],
       });
 
-      // Adding the environment again brings a new session, which is remembered.
-      h.registry.set(h.operateScopeAtom(ENVIRONMENT_ID), { granted: true });
+      // Adding the environment again lets its session be remembered.
+      h.registry.set(h.registeredAtom(ENVIRONMENT_ID), true);
       expect(h.registry.get(permitted)).toBe(true);
       expect(JSON.parse(yield* Queue.take(writes)).operableEnvironmentIds).toEqual([
         ENVIRONMENT_ID,
@@ -1013,6 +1021,55 @@ describe("settle and snooze while the environment is offline", () => {
       expect(result._tag === "Success" && ThreadUndo.cancelledPendingSync(result.value)).toBe(
         false,
       );
+    }),
+  );
+
+  it.effect("queues the snapshot the action was taken against, not a later one", () =>
+    Effect.gen(function* () {
+      const loaded = yield* Deferred.make<void>();
+      const h = yield* makeHarness({
+        connected: false,
+        wrapStore: (store) => ({
+          ...store,
+          load: Deferred.await(loaded).pipe(Effect.andThen(store.load)),
+        }),
+      });
+      const queued = h.commands.settle.run(h.registry, settle);
+      // The shell moves on while the queue waits for storage.
+      h.registry.set(h.snapshotAtom(ENVIRONMENT_ID), {
+        ...SNAPSHOT,
+        snapshotSequence: 5,
+        threads: [{ ...SNAPSHOT.threads[0]!, title: "Renamed on the Mac" }],
+      });
+      yield* Deferred.succeed(loaded, undefined);
+      expect((yield* Effect.promise(() => queued))._tag).toBe("Success");
+      expect(stored(h.storage)).toMatchObject([{ snapshotSequence: 1 }]);
+    }),
+  );
+
+  it.effect("does not remember a session that answers after its environment was removed", () =>
+    Effect.gen(function* () {
+      const writes = yield* Queue.unbounded<string>();
+      const storage = { value: null as string | null, writes };
+      const h = yield* makeHarness({ connected: false, storage, operateScope: null });
+      const permitted = h.commands.offlineTriagePermittedAtom(ENVIRONMENT_ID);
+      h.registry.mount(permitted);
+      // Removed while its first session request is still waiting.
+      h.registry.set(h.registeredAtom(ENVIRONMENT_ID), false);
+      yield* h.store.clearEnvironment(ENVIRONMENT_ID);
+      yield* Queue.take(writes);
+      h.registry.set(h.operateScopeAtom(ENVIRONMENT_ID), true);
+      expect(h.registry.get(permitted)).toBe(false);
+      // The store runs writes in order, so this one follows any grant write.
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      expect(JSON.parse(yield* Queue.take(writes)).operableEnvironmentIds).toEqual([]);
+
+      // Registering it again lets its session be remembered.
+      h.registry.set(h.registeredAtom(ENVIRONMENT_ID), true);
+      expect(h.registry.get(permitted)).toBe(true);
+      expect(JSON.parse(yield* Queue.take(writes)).operableEnvironmentIds).toEqual([
+        ENVIRONMENT_ID,
+      ]);
     }),
   );
 });
