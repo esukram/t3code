@@ -11,7 +11,12 @@ import {
   createThreadEnvironmentAtoms,
   createThreadFamilyAtoms,
 } from "@t3tools/client-runtime/state/threads";
-import type { EnvironmentId, OrchestrationV2ThreadShell, ThreadId } from "@t3tools/contracts";
+import {
+  AuthOrchestrationOperateScope,
+  type EnvironmentId,
+  type OrchestrationV2ThreadShell,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
 import { useEffect } from "react";
@@ -19,7 +24,8 @@ import { useEffect } from "react";
 import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { appAtomRegistry } from "../rpc/atomRegistry";
-import { environmentSession } from "./session";
+import { environmentSession, readEnvironmentScope } from "./session";
+import { serverEnvironment } from "./server";
 import { environmentShell } from "./shell";
 
 export const threadFamilies = createThreadFamilyAtoms(
@@ -36,8 +42,16 @@ export const threadEnvironment = createThreadEnvironmentAtoms(
   {
     shellStatusAtom: environmentShell.statusAtom,
     operateScopeAtom: environmentSession.operateScopeAtom,
+    serverConfigAtom: serverEnvironment.configValueAtom,
   },
 );
+/** Settle, snooze and their undo can queue offline where the last session could operate. */
+export function readThreadTriageScope(environmentId: EnvironmentId): boolean {
+  return (
+    readEnvironmentScope(environmentId, AuthOrchestrationOperateScope) ||
+    appAtomRegistry.get(threadEnvironment.offlineTriagePermittedAtom(environmentId))
+  );
+}
 const environmentThreads = createEnvironmentThreadStateAtoms(connectionAtomRuntime);
 export const environmentThreadDetails = createEnvironmentThreadDetailAtoms(
   environmentThreads.stateAtom,

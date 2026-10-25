@@ -8,6 +8,7 @@ import {
   type EnvironmentId,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ThreadShell,
+  type ServerConfig,
 } from "@t3tools/contracts";
 
 import { createOptimisticThreadLifecycle } from "./threadLifecycle.ts";
@@ -196,6 +197,8 @@ export function createThreadEnvironmentAtoms<R, E>(
     readonly shellStatusAtom?: (environmentId: EnvironmentId) => Atom.Atom<EnvironmentShellStatus>;
     /** Whether the loaded session can change threads; null until it loads. */
     readonly operateScopeAtom?: (environmentId: EnvironmentId) => Atom.Atom<boolean | null>;
+    /** Cached config; offline changes queue only for servers that can check them. */
+    readonly serverConfigAtom?: (environmentId: EnvironmentId) => Atom.Atom<ServerConfig | null>;
   } = {},
 ) {
   const scheduler = createAtomCommandScheduler();

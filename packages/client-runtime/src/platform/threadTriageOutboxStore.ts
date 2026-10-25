@@ -63,6 +63,8 @@ export interface ThreadTriageOutboxStoreShape {
   readonly clearEnvironment: (
     environmentId: EnvironmentId,
   ) => Effect.Effect<void, ThreadTriageOutboxStorageError>;
+  /** Lets in-memory copies drop a removed environment's entries; returns the unsubscribe. */
+  readonly subscribeCleared: (listener: (environmentId: EnvironmentId) => void) => () => void;
 }
 
 export class ThreadTriageOutboxStore extends Context.Reference<ThreadTriageOutboxStoreShape>(
@@ -86,6 +88,7 @@ export function makeThreadTriageOutboxStore(storage: {
   readonly write: (value: string) => Effect.Effect<void, ThreadTriageOutboxStorageError>;
 }): ThreadTriageOutboxStoreShape {
   const lock = Semaphore.makeUnsafe(1);
+  const clearedListeners = new Set<(environmentId: EnvironmentId) => void>();
   const load = storage.read.pipe(
     Effect.flatMap((raw) =>
       raw === null
@@ -142,6 +145,17 @@ export function makeThreadTriageOutboxStore(storage: {
         operableEnvironmentIds: document.operableEnvironmentIds.filter(
           (id) => id !== environmentId,
         ),
-      })),
+      })).pipe(
+        // The environment is gone even if storage failed, so memory must not replay it.
+        Effect.ensuring(
+          Effect.sync(() => {
+            for (const listener of clearedListeners) listener(environmentId);
+          }),
+        ),
+      ),
+    subscribeCleared: (listener) => {
+      clearedListeners.add(listener);
+      return () => clearedListeners.delete(listener);
+    },
   };
 }

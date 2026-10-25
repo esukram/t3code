@@ -18,6 +18,7 @@ import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { appAtomRegistry } from "./atom-registry";
 import { environmentSession } from "./session";
+import { serverEnvironment } from "./server";
 import { environmentShell } from "./shell";
 
 export const threadFamilies = createThreadFamilyAtoms(
@@ -34,6 +35,7 @@ export const threadEnvironment = createThreadEnvironmentAtoms(
   {
     shellStatusAtom: environmentShell.statusAtom,
     operateScopeAtom: environmentSession.operateScopeAtom,
+    serverConfigAtom: serverEnvironment.configValueAtom,
   },
 );
 export const environmentThreads = createEnvironmentThreadStateAtoms(connectionAtomRuntime);
