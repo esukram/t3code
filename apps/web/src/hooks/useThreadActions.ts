@@ -746,7 +746,9 @@ export function useThreadActions() {
     showThreadUndoNotice({
       action: "Settled",
       claim: action,
-      undo: () => runUndoPlan(target, undoPlan),
+      // A queued settle never reached the server, so cancelling it restores everything.
+      undo: () =>
+        runUndoPlan(target, result.value.pendingSync ? [{ action: "unsettle" }] : undoPlan),
       failureTitle: "Failed to undo settle",
     });
     return result;

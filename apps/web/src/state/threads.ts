@@ -19,6 +19,7 @@ import { useEffect } from "react";
 import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { appAtomRegistry } from "../rpc/atomRegistry";
+import { environmentSession } from "./session";
 import { environmentShell } from "./shell";
 
 export const threadFamilies = createThreadFamilyAtoms(
@@ -32,6 +33,10 @@ export const olderSettledThreads = createOlderSettledThreadAtoms(
 export const threadEnvironment = createThreadEnvironmentAtoms(
   connectionAtomRuntime,
   threadFamilies.snapshotAtom,
+  {
+    shellStatusAtom: environmentShell.statusAtom,
+    operateScopeAtom: environmentSession.operateScopeAtom,
+  },
 );
 const environmentThreads = createEnvironmentThreadStateAtoms(connectionAtomRuntime);
 export const environmentThreadDetails = createEnvironmentThreadDetailAtoms(

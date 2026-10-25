@@ -1,3 +1,4 @@
+import { useAtomValue } from "@effect/atom-react";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { ThreadTerminalStatusButton } from "../ThreadStatusIndicators";
 import { discardComposerDraft } from "../../lib/discardComposerDraft";
@@ -66,6 +67,7 @@ import { useNowMinute } from "../../hooks/useNowMinute";
 import { useNowSecond } from "../../hooks/useNowSecond";
 import { vcsEnvironment } from "../../state/vcs";
 import { useEnvironmentQuery } from "../../state/query";
+import { threadEnvironment } from "../../state/threads";
 import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
 import { formatRelativeTimeLabel, parseTimestampDate } from "../../timestampFormat";
 import type { SidebarThreadSummary } from "../../types";
@@ -133,8 +135,16 @@ function compactSidebarTimeLabel(label: string): string {
 
 // Subscribes to the minute tick itself, so only the label re-renders each
 // minute. The minute is passed as the clock so it is the formatter's input.
-function RelativeTimeLabel(props: { timestamp: string | null }) {
+function RelativeTimeLabel(props: { timestamp: string | null; pendingSync?: boolean }) {
   const nowMinute = useNowMinute();
+  if (props.pendingSync) {
+    return (
+      <Tooltip>
+        <TooltipTrigger render={<span />}>Pending</TooltipTrigger>
+        <TooltipPopup side="top">Waiting to sync with its environment</TooltipPopup>
+      </Tooltip>
+    );
+  }
   return props.timestamp === null
     ? null
     : compactSidebarTimeLabel(
@@ -586,6 +596,13 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
   const threadRef = scopeThreadRef(thread.environmentId, thread.id);
   const threadKey = scopedThreadKey(threadRef);
   const canOperateThread = useEnvironmentScope(thread.environmentId, AuthOrchestrationOperateScope);
+  // Offline, snooze can still queue where the last session could change threads.
+  const offlineTriagePermitted = useAtomValue(
+    threadEnvironment.offlineTriagePermittedAtom(thread.environmentId),
+  );
+  const pendingSync = useAtomValue(threadEnvironment.pendingSyncAtom(thread.environmentId)).has(
+    thread.id,
+  );
   useEffect(() => {
     if (!canOperateThread && isRenaming) onCancelRename();
   }, [canOperateThread, isRenaming, onCancelRename]);
@@ -876,7 +893,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
     return () => window.clearTimeout(id);
   }, [snoozeGateExpiryMs, snoozeGateNow, thread]);
   const showSnoozeButton =
-    canOperateThread && props.snoozeSupported && canSnooze(thread, { now: snoozeGateNow });
+    (canOperateThread || offlineTriagePermitted) &&
+    props.snoozeSupported &&
+    canSnooze(thread, { now: snoozeGateNow });
   // Closing here, not just masking, keeps the menu from reopening when the button returns.
   if (snoozeMenuOpenRaw && !showSnoozeButton) setSnoozeMenuOpen(false);
   const snoozeMenuOpen = snoozeMenuOpenRaw && showSnoozeButton;
@@ -1168,6 +1187,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                   ) : (
                     <span className="text-xs">
                       <RelativeTimeLabel
+                        pendingSync={pendingSync}
                         timestamp={
                           variantAction === "unsettle"
                             ? resolveSettledThreadTimestamp(thread)
@@ -1367,7 +1387,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                         </span>
                       )
                     ) : (
-                      <RelativeTimeLabel timestamp={threadTimeTimestamp(thread)} />
+                      <RelativeTimeLabel
+                        pendingSync={pendingSync}
+                        timestamp={threadTimeTimestamp(thread)}
+                      />
                     )}
                   </span>
                   {props.settlementSupported || showSnoozeButton || hasUnsentDraft ? (

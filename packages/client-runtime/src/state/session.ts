@@ -1,4 +1,10 @@
-import type { AuthSessionState, EnvironmentId, ServerConfig } from "@t3tools/contracts";
+import {
+  AuthOrchestrationOperateScope,
+  type AuthSessionState,
+  type EnvironmentId,
+  type ServerConfig,
+  sessionGrantsScope,
+} from "@t3tools/contracts";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -155,6 +161,16 @@ function makeEnvironmentSessionAtoms<R, E>(
     ).pipe(Atom.withLabel(`environment-session-state-value:${environmentId}`)),
   );
 
+  /** Null until a session loads, so offline callers can tell unknown from denied. */
+  const operateScopeAtom = Atom.family((environmentId: EnvironmentId) =>
+    Atom.make((get): boolean | null => {
+      const result = get(sessionStateAtom(environmentId));
+      return AsyncResult.isSuccess(result)
+        ? sessionGrantsScope(result.value, AuthOrchestrationOperateScope)
+        : null;
+    }).pipe(Atom.withLabel(`environment-session-operate-scope:${environmentId}`)),
+  );
+
   return {
     initialConfigAtom,
     initialConfigValueAtom,
@@ -162,6 +178,7 @@ function makeEnvironmentSessionAtoms<R, E>(
     preparedConnectionValueAtom,
     sessionStateAtom,
     sessionStateValueAtom,
+    operateScopeAtom,
   };
 }
 

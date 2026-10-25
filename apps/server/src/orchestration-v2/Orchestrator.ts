@@ -2987,6 +2987,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
     }
+    if (
+      (command.type === "thread.settle" || command.type === "thread.snooze") &&
+      command.snapshotSequence !== undefined
+    ) {
+      const currentSequence = yield* eventSink
+        .latestSequence({ threadId: command.threadId })
+        .pipe(
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+          ),
+        );
+      if (currentSequence > command.snapshotSequence) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Thread ${command.threadId} changed after the client's snapshot.`,
+        });
+      }
+    }
     if (command.type === "thread.settle") {
       const projection = yield* loadProjectionForCommand(
         command,

@@ -15,6 +15,7 @@ import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -27,7 +28,13 @@ import { Atom, AtomRegistry } from "effect/reactivity";
 import * as EnvironmentRegistry from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import type { RpcSession } from "../rpc/session.ts";
+import type { EnvironmentShellStatus } from "./shell.ts";
 import { createThreadEnvironmentAtoms } from "./threadCommands.ts";
+import {
+  makeThreadTriageOutboxStore,
+  ThreadTriageOutboxStorageError,
+  ThreadTriageOutboxStore,
+} from "../platform/threadTriageOutboxStore.ts";
 import * as ThreadHistoryController from "./threadHistoryController.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("remote");
@@ -87,27 +94,41 @@ const SNAPSHOT: OrchestrationV2ShellSnapshot = {
 
 const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (options?: {
   readonly reconcilePendingWork?: (threadId: ThreadId) => Effect.Effect<void>;
+  readonly connected?: boolean;
+  readonly storage?: {
+    value: string | null;
+    failWrites?: boolean;
+    writes?: Queue.Queue<string>;
+  };
+  readonly versionGuard?: boolean;
+  readonly operateScope?: boolean | null;
 }) {
   const requests = yield* Queue.unbounded<{
     command: OrchestrationV2Command;
     reply: Deferred.Deferred<{ sequence: number }, Error>;
   }>();
   const reconciled = yield* Queue.unbounded<ThreadId>();
+  const liveSession = {
+    initialConfig: Effect.succeed({
+      environment: { capabilities: { threadTriageVersionGuard: options?.versionGuard ?? true } },
+    }),
+    client: {
+      [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command: OrchestrationV2Command) =>
+        Effect.gen(function* () {
+          const reply = yield* Deferred.make<{ sequence: number }, Error>();
+          yield* Queue.offer(requests, { command, reply });
+          return yield* Deferred.await(reply);
+        }),
+    },
+  } as unknown as RpcSession;
+  const session = yield* SubscriptionRef.make(
+    options?.connected === false ? Option.none<RpcSession>() : Option.some(liveSession),
+  );
   const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
-    target: { environmentId: ENVIRONMENT_ID },
-    session: yield* SubscriptionRef.make(
-      Option.some({
-        client: {
-          [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command: OrchestrationV2Command) =>
-            Effect.gen(function* () {
-              const reply = yield* Deferred.make<{ sequence: number }, Error>();
-              yield* Queue.offer(requests, { command, reply });
-              return yield* Deferred.await(reply);
-            }),
-        },
-      } as unknown as RpcSession),
-    ),
+    target: { environmentId: ENVIRONMENT_ID, label: "Mac" },
+    session,
   } as EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+  const storage = options?.storage ?? { value: null };
   const runtime = Atom.runtime(
     Layer.mergeAll(
       Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, {
@@ -119,6 +140,19 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
         Crypto.make({
           randomBytes: (size) => new Uint8Array(size),
           digest: (_algorithm, data) => Effect.succeed(data),
+        }),
+      ),
+      Layer.succeed(
+        ThreadTriageOutboxStore,
+        makeThreadTriageOutboxStore({
+          read: Effect.sync(() => storage.value),
+          write: (value) =>
+            storage.failWrites
+              ? Effect.fail(new ThreadTriageOutboxStorageError({ cause: "disk full" }))
+              : Effect.sync(() => {
+                  storage.value = value;
+                  if (storage.writes) Queue.offerUnsafe(storage.writes, value);
+                }),
         }),
       ),
       Layer.succeed(
@@ -134,12 +168,40 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
     ),
   );
   const snapshotAtom = Atom.family((_environmentId: EnvironmentId) => Atom.make(SNAPSHOT));
-  const commands = createThreadEnvironmentAtoms(runtime, snapshotAtom);
+  const statusAtom = Atom.family((_environmentId: EnvironmentId) =>
+    Atom.make<EnvironmentShellStatus>(options?.connected === false ? "cached" : "live"),
+  );
+  const operateScopeAtom = Atom.family((_environmentId: EnvironmentId) =>
+    Atom.make<boolean | null>(options?.operateScope === undefined ? true : options.operateScope),
+  );
+  const commands = createThreadEnvironmentAtoms(runtime, snapshotAtom, {
+    shellStatusAtom: statusAtom,
+    operateScopeAtom,
+  });
   const registry = AtomRegistry.make();
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
   const visibleAtom = commands.snapshotAtom(ENVIRONMENT_ID);
   registry.mount(visibleAtom);
-  return { registry, commands, snapshotAtom, visibleAtom, requests, reconciled };
+  const reconnect = (status: EnvironmentShellStatus = "live") =>
+    SubscriptionRef.set(session, Option.some(liveSession)).pipe(
+      Effect.andThen(Effect.sync(() => registry.set(statusAtom(ENVIRONMENT_ID), status))),
+    );
+  const disconnect = SubscriptionRef.set(session, Option.none()).pipe(
+    Effect.andThen(Effect.sync(() => registry.set(statusAtom(ENVIRONMENT_ID), "cached"))),
+  );
+  return {
+    registry,
+    commands,
+    snapshotAtom,
+    statusAtom,
+    operateScopeAtom,
+    visibleAtom,
+    requests,
+    reconciled,
+    storage,
+    reconnect,
+    disconnect,
+  };
 });
 
 describe("interrupt turn", () => {
@@ -251,7 +313,8 @@ describe("remote thread lifecycle commands", () => {
         const request = yield* Queue.take(h.requests);
         expect(h.registry.get(source)).toBe(initial);
         yield* Deferred.fail(request.reply, new Error("Remote rejected the action"));
-        expect((yield* Effect.promise(() => result))._tag).toBe("Failure");
+        const settled: Promise<{ readonly _tag: string }> = result;
+        expect((yield* Effect.promise(() => settled))._tag).toBe("Failure");
         expect(h.registry.get(h.visibleAtom)).toBe(initial);
       }),
   );
@@ -450,5 +513,296 @@ describe("remote thread lifecycle commands", () => {
         expect(h.registry.get(h.visibleAtom)?.threads[0]?.pendingRuntimeRequest).toBeNull();
         expect(h.registry.get(h.snapshotAtom(ENVIRONMENT_ID))).toBe(stale);
       }),
+  );
+});
+
+const waitFor = <A>(
+  registry: AtomRegistry.AtomRegistry,
+  atom: Atom.Atom<A>,
+  done: (value: A) => boolean,
+) =>
+  Effect.callback<void>((resume) => {
+    if (done(registry.get(atom))) return resume(Effect.void);
+    const unsubscribe = registry.subscribe(atom, (value) => {
+      if (!done(value)) return;
+      unsubscribe();
+      resume(Effect.void);
+    });
+    return Effect.sync(unsubscribe);
+  });
+
+describe("settle and snooze while the environment is offline", () => {
+  const settle = { environmentId: ENVIRONMENT_ID, input: { threadId: THREAD_ID } };
+  const snooze = {
+    environmentId: ENVIRONMENT_ID,
+    input: { threadId: THREAD_ID, snoozedUntil: "2099-01-01T00:00:00.000Z" },
+  };
+  const stored = (storage: { value: string | null }) =>
+    storage.value === null
+      ? []
+      : (JSON.parse(storage.value) as { entries: Array<Record<string, unknown>> }).entries;
+
+  it.effect("applies a settle locally and replays it with the cached version on reconnect", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      const result = yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      expect(result._tag).toBe("Success");
+      expect(h.registry.get(h.visibleAtom)?.threads[0]?.settledOverride).toBe("settled");
+      expect(h.registry.get(pending).has(THREAD_ID)).toBe(true);
+      const [entry] = stored(h.storage);
+      expect(entry).toMatchObject({
+        environmentId: ENVIRONMENT_ID,
+        threadId: THREAD_ID,
+        action: { type: "settle" },
+        snapshotSequence: 1,
+      });
+
+      yield* h.reconnect("synchronizing");
+      expect(yield* Queue.size(h.requests)).toBe(0);
+      h.registry.set(h.statusAtom(ENVIRONMENT_ID), "live");
+      const request = yield* Queue.take(h.requests);
+      expect(request.command).toMatchObject({
+        type: "thread.settle",
+        commandId: entry!.commandId,
+        threadId: THREAD_ID,
+        snapshotSequence: 1,
+      });
+      yield* Deferred.succeed(request.reply, { sequence: 2 });
+      yield* waitFor(h.registry, pending, (threads) => threads.size === 0);
+      expect(stored(h.storage)).toEqual([]);
+      // Stays settled until the shell catches up with the accepted command.
+      expect(h.registry.get(h.visibleAtom)?.threads[0]?.settledOverride).toBe("settled");
+      const confirmed = {
+        ...SNAPSHOT,
+        snapshotSequence: 2,
+        threads: [{ ...SNAPSHOT.threads[0]!, settledOverride: "settled" as const, settledAt: NOW }],
+      };
+      h.registry.set(h.snapshotAtom(ENVIRONMENT_ID), confirmed);
+      expect(h.registry.get(h.visibleAtom)).toBe(confirmed);
+    }),
+  );
+
+  it.effect("restores a queued snooze after a restart and replays it once", () =>
+    Effect.gen(function* () {
+      const storage = { value: null as string | null };
+      const first = yield* makeHarness({ connected: false, storage });
+      expect(
+        (yield* Effect.promise(() => first.commands.snooze.run(first.registry, snooze)))._tag,
+      ).toBe("Success");
+      const [entry] = stored(storage);
+
+      const restarted = yield* makeHarness({ connected: false, storage });
+      const pending = restarted.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      restarted.registry.mount(pending);
+      yield* waitFor(restarted.registry, pending, (threads) => threads.has(THREAD_ID));
+      expect(restarted.registry.get(restarted.visibleAtom)?.threads[0]?.snoozedUntil).toEqual(
+        FUTURE,
+      );
+
+      yield* restarted.reconnect();
+      const request = yield* Queue.take(restarted.requests);
+      expect(request.command).toMatchObject({
+        type: "thread.snooze",
+        commandId: entry!.commandId,
+        snoozedUntil: "2099-01-01T00:00:00.000Z",
+      });
+      yield* Deferred.succeed(request.reply, { sequence: 2 });
+      yield* waitFor(restarted.registry, pending, (threads) => threads.size === 0);
+      expect(yield* Queue.size(restarted.requests)).toBe(0);
+    }),
+  );
+
+  it.effect("shows the server state when the server rejects the replay as changed", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      const changed = {
+        ...SNAPSHOT,
+        snapshotSequence: 5,
+        threads: [
+          { ...SNAPSHOT.threads[0]!, title: "Changed on the Mac", status: "running" as const },
+        ],
+      };
+      h.registry.set(h.snapshotAtom(ENVIRONMENT_ID), changed);
+      yield* h.reconnect();
+      const request = yield* Queue.take(h.requests);
+      yield* Deferred.fail(request.reply, new Error("Thread changed after the client's version."));
+      yield* waitFor(h.registry, pending, (threads) => threads.size === 0);
+      expect(stored(h.storage)).toEqual([]);
+      expect(h.registry.get(h.visibleAtom)).toBe(changed);
+    }),
+  );
+
+  it.effect("keeps the queued action when the connection drops again and retries it", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      const [entry] = stored(h.storage);
+      // The shell reports live from a stale stream while the session is already gone.
+      h.registry.set(h.statusAtom(ENVIRONMENT_ID), "live");
+      yield* h.disconnect;
+      expect(h.registry.get(pending).has(THREAD_ID)).toBe(true);
+      yield* h.reconnect();
+      const request = yield* Queue.take(h.requests);
+      expect(request.command.commandId).toBe(entry!.commandId);
+      yield* Deferred.succeed(request.reply, { sequence: 2 });
+      yield* waitFor(h.registry, pending, (threads) => threads.size === 0);
+    }),
+  );
+
+  it.effect.each([
+    ["settle", "unsettle"],
+    ["snooze", "unsnooze"],
+  ] as const)("undoing a queued %s cancels it without contacting the server", ([action, undo]) =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      yield* Effect.promise(() => h.commands[action].run(h.registry, snooze));
+      const result = yield* Effect.promise(() =>
+        h.commands[undo].run(h.registry, {
+          environmentId: ENVIRONMENT_ID,
+          input: { threadId: THREAD_ID, reason: "user" },
+        }),
+      );
+      expect(result._tag).toBe("Success");
+      expect(h.registry.get(pending).size).toBe(0);
+      expect(stored(h.storage)).toEqual([]);
+      expect(h.registry.get(h.visibleAtom)).toBe(SNAPSHOT);
+      yield* h.reconnect();
+      expect(yield* Queue.size(h.requests)).toBe(0);
+    }),
+  );
+
+  it.effect("drops a queued snooze that expired before the reconnect", () =>
+    Effect.gen(function* () {
+      const storage = { value: null as string | null };
+      const h = yield* makeHarness({ connected: false, storage });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      yield* Effect.promise(() => h.commands.snooze.run(h.registry, snooze));
+      storage.value = storage.value!.replace(
+        "2099-01-01T00:00:00.000Z",
+        "2000-01-01T00:00:00.000Z",
+      );
+      const restarted = yield* makeHarness({ connected: false, storage });
+      const restartedPending = restarted.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      restarted.registry.mount(restartedPending);
+      yield* waitFor(restarted.registry, restartedPending, (threads) => threads.size === 1);
+      yield* restarted.reconnect();
+      yield* waitFor(restarted.registry, restartedPending, (threads) => threads.size === 0);
+      expect(yield* Queue.size(restarted.requests)).toBe(0);
+      expect(stored(storage)).toEqual([]);
+    }),
+  );
+
+  it.effect("keeps the not-connected failure when the change cannot be saved", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({
+        connected: false,
+        storage: { value: null, failWrites: true },
+      });
+      const result = yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      expect(result._tag).toBe("Failure");
+      expect(String(result._tag === "Failure" ? Cause.squash(result.cause) : "")).toContain(
+        "Mac is not connected.",
+      );
+      expect(h.registry.get(h.visibleAtom)).toBe(SNAPSHOT);
+    }),
+  );
+
+  it.effect("drops a queued change when the server cannot check versions", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false, versionGuard: false });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      yield* h.reconnect();
+      yield* waitFor(h.registry, pending, (threads) => threads.size === 0);
+      expect(yield* Queue.size(h.requests)).toBe(0);
+      expect(h.registry.get(h.visibleAtom)).toBe(SNAPSHOT);
+    }),
+  );
+
+  it.effect("keeps queued changes to their own environment", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false });
+      const other = EnvironmentId.make("other-remote");
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      expect(h.registry.get(h.commands.snapshotAtom(other))).toBe(SNAPSHOT);
+      expect(h.registry.get(h.commands.pendingSyncAtom(other)).size).toBe(0);
+    }),
+  );
+
+  it.effect("remembers which environments may triage offline across a cold restart", () =>
+    Effect.gen(function* () {
+      const writes = yield* Queue.unbounded<string>();
+      const storage = { value: null as string | null, writes };
+      const online = yield* makeHarness({ storage, operateScope: true });
+      online.registry.mount(online.commands.offlineTriagePermittedAtom(ENVIRONMENT_ID));
+      yield* Queue.take(writes);
+
+      const coldOffline = yield* makeHarness({ connected: false, storage, operateScope: null });
+      const permitted = coldOffline.commands.offlineTriagePermittedAtom(ENVIRONMENT_ID);
+      coldOffline.registry.mount(permitted);
+      yield* waitFor(coldOffline.registry, permitted, (value) => value);
+
+      // A session that loads without the scope wins and is remembered for the next restart.
+      coldOffline.registry.set(coldOffline.operateScopeAtom(ENVIRONMENT_ID), false);
+      expect(coldOffline.registry.get(permitted)).toBe(false);
+      yield* Queue.take(writes);
+      const restarted = yield* makeHarness({ connected: false, storage, operateScope: null });
+      const restartedPermitted = restarted.commands.offlineTriagePermittedAtom(ENVIRONMENT_ID);
+      restarted.registry.mount(restartedPermitted);
+      yield* Effect.promise(() =>
+        restarted.commands.settle.run(restarted.registry, {
+          environmentId: ENVIRONMENT_ID,
+          input: { threadId: THREAD_ID },
+        }),
+      );
+      expect(restarted.registry.get(restartedPermitted)).toBe(false);
+    }),
+  );
+
+  it.effect("does not allow offline triage for an environment never seen with the scope", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false, operateScope: null });
+      const permitted = h.commands.offlineTriagePermittedAtom(ENVIRONMENT_ID);
+      h.registry.mount(permitted);
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      expect(h.registry.get(permitted)).toBe(false);
+    }),
+  );
+
+  it.effect("keeps a queued settle when Undo cannot remove it from storage", () =>
+    Effect.gen(function* () {
+      const storage = { value: null as string | null, failWrites: false };
+      const h = yield* makeHarness({ connected: false, storage });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      storage.failWrites = true;
+      const undo = yield* Effect.promise(() =>
+        h.commands.unsettle.run(h.registry, {
+          environmentId: ENVIRONMENT_ID,
+          input: { threadId: THREAD_ID, reason: "user" },
+        }),
+      );
+      expect(undo._tag).toBe("Failure");
+      expect(h.registry.get(pending).has(THREAD_ID)).toBe(true);
+      expect(h.registry.get(h.visibleAtom)?.threads[0]?.settledOverride).toBe("settled");
+
+      storage.failWrites = false;
+      const restarted = yield* makeHarness({ connected: false, storage });
+      const restartedPending = restarted.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      restarted.registry.mount(restartedPending);
+      yield* waitFor(restarted.registry, restartedPending, (threads) => threads.has(THREAD_ID));
+    }),
   );
 });

@@ -7,9 +7,12 @@ import {
   WS_METHODS,
   type EnvironmentId,
   type OrchestrationV2ShellSnapshot,
+  type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 
 import { createOptimisticThreadLifecycle } from "./threadLifecycle.ts";
+import type { EnvironmentShellStatus } from "./shell.ts";
+import { createThreadTriageOutbox } from "./threadTriageOutbox.ts";
 import * as DateTime from "effect/DateTime";
 
 import {
@@ -143,9 +146,57 @@ export type {
   WatchThreadPullRequestInput,
 } from "../operations/commands.ts";
 
+function applySettle(
+  thread: OrchestrationV2ThreadShell,
+  now: DateTime.Utc,
+  accepted: boolean,
+): OrchestrationV2ThreadShell {
+  return !accepted &&
+    (thread.pendingRuntimeRequest !== null ||
+      ["preparing", "queued", "starting", "running", "waiting"].includes(thread.status))
+    ? thread
+    : {
+        ...thread,
+        pendingRuntimeRequest: null,
+        settledOverride: "settled",
+        settledAt: thread.settledOverride === "settled" ? (thread.settledAt ?? now) : now,
+        unsettledAt: null,
+        activeOrderKey: null,
+        pinnedAt: null,
+        pinOrderKey: null,
+        snoozedAt: null,
+        snoozedUntil: null,
+      };
+}
+
+function applySnooze(
+  thread: OrchestrationV2ThreadShell,
+  snoozedUntil: string,
+  now: DateTime.Utc,
+  accepted: boolean,
+): OrchestrationV2ThreadShell {
+  return (!accepted &&
+    (thread.pendingRuntimeRequest !== null ||
+      ["preparing", "queued", "starting"].includes(thread.status))) ||
+    !(Date.parse(snoozedUntil) > DateTime.toEpochMillis(now))
+    ? thread
+    : {
+        ...thread,
+        pendingRuntimeRequest: null,
+        snoozedUntil: DateTime.makeUnsafe(snoozedUntil),
+        snoozedAt: now,
+      };
+}
+
 export function createThreadEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | Crypto.Crypto | R, E>,
   snapshotAtom: (environmentId: EnvironmentId) => Atom.Atom<OrchestrationV2ShellSnapshot | null>,
+  options: {
+    /** Offline settle and snooze replay once this reports a synchronized shell. */
+    readonly shellStatusAtom?: (environmentId: EnvironmentId) => Atom.Atom<EnvironmentShellStatus>;
+    /** Whether the loaded session can change threads; null until it loads. */
+    readonly operateScopeAtom?: (environmentId: EnvironmentId) => Atom.Atom<boolean | null>;
+  } = {},
 ) {
   const scheduler = createAtomCommandScheduler();
   const concurrency = {
@@ -444,52 +495,57 @@ export function createThreadEnvironmentAtoms<R, E>(
       concurrency,
     }),
   };
-  const optimistic = createOptimisticThreadLifecycle(snapshotAtom);
+  const triage = createThreadTriageOutbox({
+    runtime,
+    sourceSnapshotAtom: snapshotAtom,
+    ...options,
+    applySettle: (thread, queuedAt) => applySettle(thread, queuedAt, false),
+    applySnooze: (thread, snoozedUntil, queuedAt) =>
+      applySnooze(thread, snoozedUntil, queuedAt, false),
+    replay: (registry, { environmentId, threadId, commandId, action, snapshotSequence }) =>
+      action.type === "settle"
+        ? settle.run(registry, { environmentId, input: { threadId, commandId, snapshotSequence } })
+        : snooze.run(registry, {
+            environmentId,
+            input: { threadId, commandId, snapshotSequence, snoozedUntil: action.snoozedUntil },
+          }),
+  });
+  const optimistic = createOptimisticThreadLifecycle(triage.snapshotAtom);
+  const settle = optimistic.wrap(commands.settle, (thread, _input, now, accepted) =>
+    applySettle(thread, now, accepted),
+  );
+  const snooze = optimistic.wrap(commands.snooze, (thread, input, now, accepted) =>
+    applySnooze(thread, input.snoozedUntil, now, accepted),
+  );
   return {
     ...commands,
     snapshotAtom: optimistic.snapshotAtom,
-    settle: optimistic.wrap(commands.settle, (thread, _input, now, accepted) =>
-      !accepted &&
-      (thread.pendingRuntimeRequest !== null ||
-        ["preparing", "queued", "starting", "running", "waiting"].includes(thread.status))
-        ? thread
-        : {
-            ...thread,
-            pendingRuntimeRequest: null,
-            settledOverride: "settled",
-            settledAt: thread.settledOverride === "settled" ? (thread.settledAt ?? now) : now,
-            unsettledAt: null,
-            activeOrderKey: null,
-            pinnedAt: null,
-            pinOrderKey: null,
-            snoozedAt: null,
-            snoozedUntil: null,
-          },
+    pendingSyncAtom: triage.pendingSyncAtom,
+    offlineTriagePermittedAtom: triage.offlineTriagePermittedAtom,
+    settle: triage.queueWhenOffline(settle, () => ({ type: "settle" as const })),
+    unsettle: triage.cancelQueued(
+      optimistic.wrap(commands.unsettle, (thread, input, now) => ({
+        ...thread,
+        settledOverride: input.reason === "user" ? "active" : null,
+        settledAt: null,
+        unsettledAt: thread.settledOverride === "active" ? (thread.unsettledAt ?? null) : now,
+      })),
+      "settle",
+      { sequence: 0 },
     ),
-    unsettle: optimistic.wrap(commands.unsettle, (thread, input, now) => ({
-      ...thread,
-      settledOverride: input.reason === "user" ? "active" : null,
-      settledAt: null,
-      unsettledAt: thread.settledOverride === "active" ? (thread.unsettledAt ?? null) : now,
+    snooze: triage.queueWhenOffline(snooze, (input) => ({
+      type: "snooze" as const,
+      snoozedUntil: input.snoozedUntil,
     })),
-    snooze: optimistic.wrap(commands.snooze, (thread, input, now, accepted) =>
-      (!accepted &&
-        (thread.pendingRuntimeRequest !== null ||
-          ["preparing", "queued", "starting"].includes(thread.status))) ||
-      !(Date.parse(input.snoozedUntil) > DateTime.toEpochMillis(now))
-        ? thread
-        : {
-            ...thread,
-            pendingRuntimeRequest: null,
-            snoozedUntil: DateTime.makeUnsafe(input.snoozedUntil),
-            snoozedAt: now,
-          },
+    unsnooze: triage.cancelQueued(
+      optimistic.wrap(commands.unsnooze, (thread) => ({
+        ...thread,
+        snoozedUntil: null,
+        snoozedAt: null,
+      })),
+      "snooze",
+      { sequence: 0 },
     ),
-    unsnooze: optimistic.wrap(commands.unsnooze, (thread) => ({
-      ...thread,
-      snoozedUntil: null,
-      snoozedAt: null,
-    })),
     setAutoSettle: optimistic.wrap(commands.setAutoSettle, (thread, input, now) => ({
       ...thread,
       autoSettleDisabledAt: input.enabled ? null : (thread.autoSettleDisabledAt ?? now),
