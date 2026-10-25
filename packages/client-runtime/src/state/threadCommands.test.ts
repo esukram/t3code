@@ -31,6 +31,7 @@ import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import type { EnvironmentShellStatus } from "./shell.ts";
 import { createThreadEnvironmentAtoms } from "./threadCommands.ts";
+import * as ThreadUndo from "./threadUndo.ts";
 import {
   makeThreadTriageOutboxStore,
   ThreadTriageOutboxStorageError,
@@ -178,7 +179,9 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
     Atom.make<EnvironmentShellStatus>(options?.connected === false ? "cached" : "live"),
   );
   const operateScopeAtom = Atom.family((_environmentId: EnvironmentId) =>
-    Atom.make<boolean | null>(options?.operateScope === undefined ? true : options.operateScope),
+    Atom.make<{ readonly granted: boolean } | null>(
+      options?.operateScope === null ? null : { granted: options?.operateScope ?? true },
+    ),
   );
   const serverConfigAtom = Atom.family((_environmentId: EnvironmentId) =>
     Atom.make({
@@ -687,7 +690,7 @@ describe("settle and snooze while the environment is offline", () => {
           input: { threadId: THREAD_ID, reason: "user" },
         }),
       );
-      expect(result._tag).toBe("Success");
+      expect(result._tag === "Success" && ThreadUndo.cancelledPendingSync(result.value)).toBe(true);
       expect(h.registry.get(pending).size).toBe(0);
       expect(stored(h.storage)).toEqual([]);
       expect(h.registry.get(h.visibleAtom)).toBe(SNAPSHOT);
@@ -851,7 +854,7 @@ describe("settle and snooze while the environment is offline", () => {
       yield* waitFor(coldOffline.registry, permitted, (value) => value);
 
       // A session that loads without the scope wins and is remembered for the next restart.
-      coldOffline.registry.set(coldOffline.operateScopeAtom(ENVIRONMENT_ID), false);
+      coldOffline.registry.set(coldOffline.operateScopeAtom(ENVIRONMENT_ID), { granted: false });
       expect(coldOffline.registry.get(permitted)).toBe(false);
       yield* Queue.take(writes);
       const restarted = yield* makeHarness({ connected: false, storage, operateScope: null });
@@ -913,10 +916,11 @@ describe("settle and snooze while the environment is offline", () => {
       expect(stored(storage)).toHaveLength(1);
 
       // The removal lands after the read but before the loaded document is published.
+      // The session from before the removal is still loaded and still grants the scope.
       const h = yield* makeHarness({
         connected: false,
         storage,
-        operateScope: null,
+        operateScope: true,
         wrapStore: (store) => ({
           ...store,
           load: store.load.pipe(Effect.tap(() => store.clearEnvironment(ENVIRONMENT_ID))),
@@ -941,6 +945,74 @@ describe("settle and snooze while the environment is offline", () => {
       expect([...h.registry.get(pending)]).toEqual([laterThreadId]);
       expect(stored(storage)).toMatchObject([{ threadId: laterThreadId }]);
       expect(h.registry.get(permitted)).toBe(false);
+      expect(JSON.parse(storage.value!).operableEnvironmentIds).toEqual([]);
+    }),
+  );
+
+  it.effect("does not let a retained session or an in-flight write restore a removed grant", () =>
+    Effect.gen(function* () {
+      const writes = yield* Queue.unbounded<string>();
+      const storage = { value: null as string | null, writes };
+      let removeBeforeWrite = true;
+      const h = yield* makeHarness({
+        connected: false,
+        storage,
+        operateScope: true,
+        // The removal lands while the grant's write waits for the store.
+        wrapStore: (store) => ({
+          ...store,
+          setOperable: (environmentId, operable, stillCurrent) =>
+            (removeBeforeWrite
+              ? Effect.sync(() => {
+                  removeBeforeWrite = false;
+                }).pipe(Effect.andThen(store.clearEnvironment(environmentId)))
+              : Effect.void
+            ).pipe(Effect.andThen(store.setOperable(environmentId, operable, stillCurrent))),
+        }),
+      });
+      const permitted = h.commands.offlineTriagePermittedAtom(ENVIRONMENT_ID);
+      h.registry.mount(permitted);
+      expect(JSON.parse(yield* Queue.take(writes)).operableEnvironmentIds).toEqual([]);
+      expect(h.registry.get(permitted)).toBe(false);
+      // The store runs writes in order, so this one follows the skipped grant.
+      yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      expect(JSON.parse(yield* Queue.take(writes))).toMatchObject({
+        entries: [{ threadId: THREAD_ID }],
+        operableEnvironmentIds: [],
+      });
+
+      // Adding the environment again brings a new session, which is remembered.
+      h.registry.set(h.operateScopeAtom(ENVIRONMENT_ID), { granted: true });
+      expect(h.registry.get(permitted)).toBe(true);
+      expect(JSON.parse(yield* Queue.take(writes)).operableEnvironmentIds).toEqual([
+        ENVIRONMENT_ID,
+      ]);
+    }),
+  );
+
+  it.effect("Undo after a queued settle was delivered un-settles on the server", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ connected: false });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      const queued = yield* Effect.promise(() => h.commands.settle.run(h.registry, settle));
+      expect(queued._tag === "Success" && queued.value.pendingSync).toBe(true);
+      yield* h.reconnect();
+      const replay = yield* Queue.take(h.requests);
+      yield* Deferred.succeed(replay.reply, { sequence: 2 });
+      yield* waitFor(h.registry, pending, (threads) => threads.size === 0);
+
+      const undo = h.commands.unsettle.run(h.registry, {
+        environmentId: ENVIRONMENT_ID,
+        input: { threadId: THREAD_ID, reason: "user" },
+      });
+      const request = yield* Queue.take(h.requests);
+      expect(request.command.type).toBe("thread.unsettle");
+      yield* Deferred.succeed(request.reply, { sequence: 3 });
+      const result = yield* Effect.promise(() => undo);
+      expect(result._tag === "Success" && ThreadUndo.cancelledPendingSync(result.value)).toBe(
+        false,
+      );
     }),
   );
 });

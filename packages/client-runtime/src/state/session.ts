@@ -161,13 +161,22 @@ function makeEnvironmentSessionAtoms<R, E>(
     ).pipe(Atom.withLabel(`environment-session-state-value:${environmentId}`)),
   );
 
-  /** Null until a session loads, so offline callers can tell unknown from denied. */
+  /**
+   * Null until a session loads, so offline callers can tell unknown from denied. Each loaded
+   * session gets its own object, so callers can tell a new session from a retained one.
+   */
+  const operateGrants = new WeakMap<AuthSessionState, { readonly granted: boolean }>();
   const operateScopeAtom = Atom.family((environmentId: EnvironmentId) =>
-    Atom.make((get): boolean | null => {
+    Atom.make((get): { readonly granted: boolean } | null => {
       const result = get(sessionStateAtom(environmentId));
-      return AsyncResult.isSuccess(result)
-        ? sessionGrantsScope(result.value, AuthOrchestrationOperateScope)
-        : null;
+      if (!AsyncResult.isSuccess(result)) return null;
+      const existing = operateGrants.get(result.value);
+      if (existing !== undefined) return existing;
+      const grant = {
+        granted: sessionGrantsScope(result.value, AuthOrchestrationOperateScope),
+      };
+      operateGrants.set(result.value, grant);
+      return grant;
     }).pipe(Atom.withLabel(`environment-session-operate-scope:${environmentId}`)),
   );
 

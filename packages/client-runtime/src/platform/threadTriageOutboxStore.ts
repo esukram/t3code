@@ -50,8 +50,14 @@ export const sameThreadTriage = (a: ThreadTriageKey, b: ThreadTriageKey) =>
  */
 export interface ThreadTriageOutboxStoreShape {
   readonly load: Effect.Effect<ThreadTriageOutboxDocument, ThreadTriageOutboxStorageError>;
-  /** Replaces any entry for the same thread. */
-  readonly put: (entry: PendingThreadTriage) => Effect.Effect<void, ThreadTriageOutboxStorageError>;
+  /**
+   * Replaces any entry for the same thread. `stillCurrent` runs inside the store's lock, after
+   * any earlier removal, so a write for a removed environment is skipped.
+   */
+  readonly put: (
+    entry: PendingThreadTriage,
+    stillCurrent?: () => boolean,
+  ) => Effect.Effect<void, ThreadTriageOutboxStorageError>;
   /** Only removes the entry if it still has this command id. */
   readonly remove: (
     entry: ThreadTriageKey & Pick<PendingThreadTriage, "commandId">,
@@ -59,11 +65,15 @@ export interface ThreadTriageOutboxStoreShape {
   readonly setOperable: (
     environmentId: EnvironmentId,
     operable: boolean,
+    stillCurrent?: () => boolean,
   ) => Effect.Effect<void, ThreadTriageOutboxStorageError>;
   readonly clearEnvironment: (
     environmentId: EnvironmentId,
   ) => Effect.Effect<void, ThreadTriageOutboxStorageError>;
-  /** Lets in-memory copies drop a removed environment's entries; returns the unsubscribe. */
+  /**
+   * Lets in-memory copies drop a removed environment's entries; returns the unsubscribe.
+   * Listeners run inside the store's lock, before any later write.
+   */
   readonly subscribeCleared: (listener: (environmentId: EnvironmentId) => void) => () => void;
 }
 
@@ -102,17 +112,23 @@ export function makeThreadTriageOutboxStore(storage: {
           ),
     ),
   );
+  /** A null transform skips the write. `after` still runs inside the lock. */
   const update = (
-    transform: (document: ThreadTriageOutboxDocument) => ThreadTriageOutboxDocument,
+    transform: (document: ThreadTriageOutboxDocument) => ThreadTriageOutboxDocument | null,
+    after: Effect.Effect<void> = Effect.void,
   ) =>
     lock.withPermits(1)(
       load.pipe(
-        Effect.flatMap((document) =>
-          encodeStored(transform(document)).pipe(
-            Effect.mapError((cause) => new ThreadTriageOutboxStorageError({ cause })),
-          ),
-        ),
-        Effect.flatMap(storage.write),
+        Effect.flatMap((document) => {
+          const next = transform(document);
+          return next === null
+            ? Effect.void
+            : encodeStored(next).pipe(
+                Effect.mapError((cause) => new ThreadTriageOutboxStorageError({ cause })),
+                Effect.flatMap(storage.write),
+              );
+        }),
+        Effect.ensuring(after),
       ),
     );
   const updateEntries = (
@@ -120,38 +136,48 @@ export function makeThreadTriageOutboxStore(storage: {
   ) => update((document) => ({ ...document, entries: transform(document.entries) }));
   return {
     load: lock.withPermits(1)(load),
-    put: (entry) =>
-      updateEntries((entries) => [
-        ...entries.filter((current) => !sameThreadTriage(current, entry)),
-        entry,
-      ]),
+    put: (entry, stillCurrent) =>
+      update((document) =>
+        stillCurrent?.() === false
+          ? null
+          : {
+              ...document,
+              entries: [
+                ...document.entries.filter((current) => !sameThreadTriage(current, entry)),
+                entry,
+              ],
+            },
+      ),
     remove: (entry) =>
       updateEntries((entries) =>
         entries.filter(
           (current) => !sameThreadTriage(current, entry) || current.commandId !== entry.commandId,
         ),
       ),
-    setOperable: (environmentId, operable) =>
-      update((document) => ({
-        ...document,
-        operableEnvironmentIds: [
-          ...document.operableEnvironmentIds.filter((id) => id !== environmentId),
-          ...(operable ? [environmentId] : []),
-        ],
-      })),
+    setOperable: (environmentId, operable, stillCurrent) =>
+      update((document) =>
+        stillCurrent?.() === false
+          ? null
+          : {
+              ...document,
+              operableEnvironmentIds: [
+                ...document.operableEnvironmentIds.filter((id) => id !== environmentId),
+                ...(operable ? [environmentId] : []),
+              ],
+            },
+      ),
     clearEnvironment: (environmentId) =>
-      update((document) => ({
-        entries: document.entries.filter((entry) => entry.environmentId !== environmentId),
-        operableEnvironmentIds: document.operableEnvironmentIds.filter(
-          (id) => id !== environmentId,
-        ),
-      })).pipe(
+      update(
+        (document) => ({
+          entries: document.entries.filter((entry) => entry.environmentId !== environmentId),
+          operableEnvironmentIds: document.operableEnvironmentIds.filter(
+            (id) => id !== environmentId,
+          ),
+        }),
         // The environment is gone even if storage failed, so memory must not replay it.
-        Effect.ensuring(
-          Effect.sync(() => {
-            for (const listener of clearedListeners) listener(environmentId);
-          }),
-        ),
+        Effect.sync(() => {
+          for (const listener of clearedListeners) listener(environmentId);
+        }),
       ),
     subscribeCleared: (listener) => {
       clearedListeners.add(listener);

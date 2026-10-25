@@ -196,7 +196,9 @@ export function createThreadEnvironmentAtoms<R, E>(
     /** Offline settle and snooze replay once this reports a synchronized shell. */
     readonly shellStatusAtom?: (environmentId: EnvironmentId) => Atom.Atom<EnvironmentShellStatus>;
     /** Whether the loaded session can change threads; null until it loads. */
-    readonly operateScopeAtom?: (environmentId: EnvironmentId) => Atom.Atom<boolean | null>;
+    readonly operateScopeAtom?: (
+      environmentId: EnvironmentId,
+    ) => Atom.Atom<{ readonly granted: boolean } | null>;
     /** Cached config; offline changes queue only for servers that can check them. */
     readonly serverConfigAtom?: (environmentId: EnvironmentId) => Atom.Atom<ServerConfig | null>;
   } = {},
@@ -534,7 +536,7 @@ export function createThreadEnvironmentAtoms<R, E>(
         unsettledAt: thread.settledOverride === "active" ? (thread.unsettledAt ?? null) : now,
       })),
       "settle",
-      { sequence: 0 },
+      { sequence: 0, cancelledPendingSync: true as const },
     ),
     snooze: triage.queueWhenOffline(snooze, (input) => ({
       type: "snooze" as const,
@@ -547,7 +549,7 @@ export function createThreadEnvironmentAtoms<R, E>(
         snoozedAt: null,
       })),
       "snooze",
-      { sequence: 0 },
+      { sequence: 0, cancelledPendingSync: true as const },
     ),
     setAutoSettle: optimistic.wrap(commands.setAutoSettle, (thread, input, now) => ({
       ...thread,

@@ -19,6 +19,7 @@ const state = vi.hoisted(() => ({
   archivedRefreshes: [] as string[],
   scopes: new Map<string, Set<string>>(),
   offlineTriage: new Set<string>(),
+  successValues: new Map<string, unknown>(),
   shells: [] as EnvironmentThreadShell[],
   requests: [] as {
     action: string;
@@ -149,7 +150,7 @@ vi.mock("../../state/threads", () => ({
           if (action === state.failedAction)
             return AsyncResult.failure(Cause.fail(new Error("Server rejected action")));
           state.afterRequest?.();
-          return AsyncResult.success(undefined);
+          return AsyncResult.success(state.successValues.get(action));
         },
       ]),
     ),
@@ -190,6 +191,7 @@ beforeEach(() => {
   state.pendingOrder = null;
   state.dropBusy = false;
   state.offlineTriage = new Set();
+  state.successValues = new Map();
   state.scopes = new Map([
     [primaryEnvironmentId, new Set([AuthOrchestrationOperateScope])],
     [otherEnvironmentId, new Set<string>()],
@@ -371,6 +373,25 @@ describe("thread action undo", () => {
       threadId: thread.id,
       snoozedUntil: thread.snoozedUntil,
     });
+    expect(readThreadUndoNotice()).toBeNull();
+  });
+
+  // Whether the queued settle reached the server is known only when Undo runs.
+  it.each([
+    ["cancels it before it syncs", { sequence: 0, cancelledPendingSync: true }, []],
+    ["finds it delivered", { sequence: 3 }, ["pin", "snooze"]],
+  ])("restores a queued settle only as far as needed when Undo %s", async (_, undone, restored) => {
+    state.successValues.set("settle", { sequence: 1, pendingSync: true });
+    state.successValues.set("unsettle", undone);
+    const thread = makeThread({
+      pinnedAt: "2026-09-02T00:00:00.000Z",
+      pinOrderKey: "m",
+      snoozedUntil: "2099-01-01T09:00:00.000Z",
+    });
+    expect(await useThreadListActions().settleThread(thread)).toBe(true);
+    expect(readThreadUndoNotice()?.action).toBe("Settled");
+    await readThreadUndoNotice()!.undo();
+    expect(state.requests.map(({ action }) => action)).toEqual(["settle", "unsettle", ...restored]);
     expect(readThreadUndoNotice()).toBeNull();
   });
 

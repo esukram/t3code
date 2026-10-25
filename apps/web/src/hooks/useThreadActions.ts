@@ -746,9 +746,7 @@ export function useThreadActions() {
     showThreadUndoNotice({
       action: "Settled",
       claim: action,
-      // A queued settle never reached the server, so cancelling it restores everything.
-      undo: () =>
-        runUndoPlan(target, result.value.pendingSync ? [{ action: "unsettle" }] : undoPlan),
+      undo: () => runUndoPlan(target, undoPlan),
       failureTitle: "Failed to undo settle",
     });
     return result;
@@ -887,7 +885,8 @@ export function useThreadActions() {
             });
         }
       },
-      (result) => result._tag === "Success",
+      // Cancelling a settle still waiting to sync leaves nothing on the server to restore.
+      (result) => result._tag === "Success" && !ThreadUndo.cancelledPendingSync(result.value),
     );
 
   const confirmAndDeleteThread = async (target: ScopedThreadRef) => {

@@ -141,6 +141,7 @@ function useThreadActionExecutor(
     action: ThreadListAction,
     thread: EnvironmentThreadShell,
     onStarted?: () => void,
+    onSucceeded?: (value: unknown) => void,
   ) => {
     const triage = action === "settle" || action === "unsettle";
     if (!checkThreadOperationPermission(thread, actionFailureTitle(action), triage)) return false;
@@ -205,6 +206,7 @@ function useThreadActionExecutor(
       if (action === "archive" || action === "unarchive" || action === "delete") {
         refreshArchivedThreadsForEnvironment(thread.environmentId);
       }
+      onSucceeded?.(result.value);
       onCompleted?.(action, thread);
       return true;
     })();
@@ -279,13 +281,19 @@ export function useThreadListActions(): {
       action,
       claim,
       undo: async () => {
+        // Cancelling a settle still waiting to sync leaves nothing on the server to restore.
+        let cancelledQueued = false;
         try {
           await ThreadUndo.executeThreadUndo(
             plan,
             async (step) => {
               switch (step.action) {
                 case "unsettle":
-                  return unsettleThread(thread);
+                  return (
+                    (await executeAction("unsettle", thread, undefined, (value) => {
+                      cancelledQueued = ThreadUndo.cancelledPendingSync(value);
+                    })) === true
+                  );
                 case "unsnooze":
                   return unsnoozeThread(thread);
                 case "pin":
@@ -310,7 +318,7 @@ export function useThreadListActions(): {
                 }
               }
             },
-            (result) => result,
+            (result) => result && !cancelledQueued,
           );
         } catch (error) {
           Dialog.alert(
@@ -330,11 +338,7 @@ export function useThreadListActions(): {
       claim = ThreadUndo.begin("settle", key);
     });
     if (claim) {
-      // A queued settle never reached the server, so cancelling it restores everything.
-      const queued = appAtomRegistry
-        .get(threadEnvironment.pendingSyncAtom(thread.environmentId))
-        .has(thread.id);
-      if (succeeded) offerUndo(thread, "Settled", claim, queued ? [{ action: "unsettle" }] : plan);
+      if (succeeded) offerUndo(thread, "Settled", claim, plan);
       else claim.finish();
     }
     return succeeded;
