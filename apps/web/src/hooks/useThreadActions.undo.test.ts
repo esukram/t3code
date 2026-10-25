@@ -96,6 +96,7 @@ beforeEach(() => {
   for (const command of Object.values(commands)) {
     command.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
   }
+  commands.settle.mockResolvedValue({ _tag: "Success", value: { sequence: 1 } });
   router.navigate.mockClear();
   router.state.matches[0]!.params = {};
   threadShell.pinnedAt = null;
@@ -233,6 +234,24 @@ describe("settle and snooze Undo", () => {
       environmentId: target.environmentId,
       input: { threadId: target.threadId, snoozedUntil },
     });
+  });
+
+  // A settle queued offline never reached the server, so cancelling it restores pin and snooze.
+  it("only cancels a settle that is still waiting to sync", async () => {
+    threadShell.pinnedAt = "2026-01-01T00:00:00.000Z";
+    threadShell.snoozedUntil = "2030-01-01T09:00:00.000Z";
+    commands.settle.mockResolvedValue({
+      _tag: "Success",
+      value: { sequence: 1, pendingSync: true },
+    });
+    await useThreadActions().settleThread(target);
+    await currentUndo()();
+    expect(commands.unsettle).toHaveBeenCalledExactlyOnceWith({
+      environmentId: target.environmentId,
+      input: { threadId: target.threadId, reason: "user" },
+    });
+    expect(commands.pin).not.toHaveBeenCalled();
+    expect(commands.snooze).not.toHaveBeenCalled();
   });
 
   it("stops settle restoration if restoring the pin fails", async () => {
