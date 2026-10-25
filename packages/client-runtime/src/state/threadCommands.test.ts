@@ -35,6 +35,7 @@ import {
   makeThreadTriageOutboxStore,
   ThreadTriageOutboxStorageError,
   ThreadTriageOutboxStore,
+  type ThreadTriageOutboxStoreShape,
 } from "../platform/threadTriageOutboxStore.ts";
 import * as ThreadHistoryController from "./threadHistoryController.ts";
 
@@ -105,6 +106,7 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
   readonly operateScope?: boolean | null;
   /** The guard capability in the cached config, which may differ from the live server's. */
   readonly cachedVersionGuard?: boolean;
+  readonly wrapStore?: (store: ThreadTriageOutboxStoreShape) => ThreadTriageOutboxStoreShape;
 }) {
   const requests = yield* Queue.unbounded<{
     command: OrchestrationV2Command;
@@ -158,7 +160,7 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* (optio
           digest: (_algorithm, data) => Effect.succeed(data),
         }),
       ),
-      Layer.succeed(ThreadTriageOutboxStore, store),
+      Layer.succeed(ThreadTriageOutboxStore, options?.wrapStore?.(store) ?? store),
       Layer.succeed(
         ThreadHistoryController.ThreadHistoryController,
         ThreadHistoryController.ThreadHistoryController.of({
@@ -898,6 +900,47 @@ describe("settle and snooze while the environment is offline", () => {
       const restartedPending = restarted.commands.pendingSyncAtom(ENVIRONMENT_ID);
       restarted.registry.mount(restartedPending);
       yield* waitFor(restarted.registry, restartedPending, (threads) => threads.has(THREAD_ID));
+    }),
+  );
+
+  it.effect("does not restore changes of an environment removed while they load", () =>
+    Effect.gen(function* () {
+      const writes = yield* Queue.unbounded<string>();
+      const storage = { value: null as string | null, writes };
+      const before = yield* makeHarness({ connected: false, storage, operateScope: true });
+      before.registry.mount(before.commands.offlineTriagePermittedAtom(ENVIRONMENT_ID));
+      yield* Effect.promise(() => before.commands.settle.run(before.registry, settle));
+      expect(stored(storage)).toHaveLength(1);
+
+      // The removal lands after the read but before the loaded document is published.
+      const h = yield* makeHarness({
+        connected: false,
+        storage,
+        operateScope: null,
+        wrapStore: (store) => ({
+          ...store,
+          load: store.load.pipe(Effect.tap(() => store.clearEnvironment(ENVIRONMENT_ID))),
+        }),
+      });
+      const laterThreadId = ThreadId.make("later-thread");
+      h.registry.set(h.snapshotAtom(ENVIRONMENT_ID), {
+        ...SNAPSHOT,
+        threads: [...SNAPSHOT.threads, { ...SNAPSHOT.threads[0]!, id: laterThreadId }],
+      });
+      const pending = h.commands.pendingSyncAtom(ENVIRONMENT_ID);
+      const permitted = h.commands.offlineTriagePermittedAtom(ENVIRONMENT_ID);
+      h.registry.mount(pending);
+      h.registry.mount(permitted);
+      // Queueing another thread waits for the load to publish its document.
+      yield* Effect.promise(() =>
+        h.commands.settle.run(h.registry, {
+          environmentId: ENVIRONMENT_ID,
+          input: { threadId: laterThreadId },
+        }),
+      );
+      expect([...h.registry.get(pending)]).toEqual([laterThreadId]);
+      expect(stored(storage)).toMatchObject([{ threadId: laterThreadId }]);
+      expect(h.registry.get(permitted)).toBe(false);
     }),
   );
 });

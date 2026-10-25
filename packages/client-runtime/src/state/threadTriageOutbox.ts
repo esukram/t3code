@@ -160,15 +160,24 @@ export function createThreadTriageOutbox<R, E>(input: {
     }),
   });
 
+  /** Bumped when an environment is removed so in-flight work does not re-add its entries. */
+  const generations = new Map<EnvironmentId, number>();
   const documentAtom = Atom.make<ThreadTriageOutboxDocument | null>(null).pipe(Atom.keepAlive);
   let loading: Promise<ThreadTriageOutboxDocument> | undefined;
   const ensureLoaded = (registry: AtomRegistry.AtomRegistry) => {
     const loaded = registry.get(documentAtom);
     if (loaded !== null) return Promise.resolve(loaded);
-    loading ??= store.run(registry, { _tag: "load" }).then((result) => {
-      const current =
-        registry.get(documentAtom) ??
-        (AsyncResult.isSuccess(result) ? result.value : EMPTY_DOCUMENT);
+    if (loading !== undefined) return loading;
+    const loadStarted = new Map(generations);
+    loading = store.run(registry, { _tag: "load" }).then((result) => {
+      const loadedDocument = AsyncResult.isSuccess(result) ? result.value : EMPTY_DOCUMENT;
+      // An environment removed while the read was in flight must not come back from it.
+      const removed = (environmentId: EnvironmentId) =>
+        (generations.get(environmentId) ?? 0) !== (loadStarted.get(environmentId) ?? 0);
+      const current = registry.get(documentAtom) ?? {
+        entries: loadedDocument.entries.filter((entry) => !removed(entry.environmentId)),
+        operableEnvironmentIds: loadedDocument.operableEnvironmentIds.filter((id) => !removed(id)),
+      };
       registry.set(documentAtom, current);
       return current;
     });
@@ -187,8 +196,6 @@ export function createThreadTriageOutbox<R, E>(input: {
 
   /** One owner per thread at a time: a replay, an Undo, or a replacing action. */
   const claimed = new Set<string>();
-  /** Bumped when an environment is removed so in-flight work does not re-add its entries. */
-  const generations = new Map<EnvironmentId, number>();
   const clearLocal = (registry: AtomRegistry.AtomRegistry, environmentId: EnvironmentId) => {
     generations.set(environmentId, (generations.get(environmentId) ?? 0) + 1);
     const document = registry.get(documentAtom);

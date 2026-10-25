@@ -459,10 +459,14 @@ export function SortableThreadRow(
     rowProps.thread.environmentId,
     AuthOrchestrationOperateScope,
   );
+  // Offline, a drop onto Settled can still queue; the drop handler keeps other moves live-only.
+  const canTriageThread = useAtomValue(
+    threadEnvironment.offlineTriagePermittedAtom(rowProps.thread.environmentId),
+  );
   const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: sortableId,
     disabled:
-      sortableDisabled || !canOperateThread
+      sortableDisabled || !(canOperateThread || canTriageThread)
         ? SIDEBAR_SORTABLE_DRAG_DISABLED
         : SIDEBAR_SORTABLE_DRAG_ENABLED,
     animateLayoutChanges: animateSidebarLayoutChanges,
